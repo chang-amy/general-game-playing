@@ -18,7 +18,7 @@
 
 // ==================== Ultimate Lemur Player ====================
 //
-// PLayer has been updated to include pruning. Results are as follows:
+// Player has been updated to include pruning. Results are as follows:
 //
 // Hunter: Score 87 with and without pruning, but with pruning
 // Lemur efficiently solves hunter on one board rather
@@ -273,14 +273,21 @@ function compareLexicographically(a, b) {
  */
 function evaluateLexZeroSum(gameState) {
   const myScore = findreward(playerRole, gameState, gameRulesLibrary);
-  const opponentRole = selectedEngine.getOpponentRole();
-  const opponentScore = findreward(opponentRole, gameState, gameRulesLibrary);
+  const opponentRoles = selectedEngine.getOpponentRoles();
+
+  const opponentScores = opponentRoles.map(r => findreward(r, gameState, gameRulesLibrary));
+  const maxOpponent = Math.max(...opponentScores);
+
   const isTerminal = findterminalp(gameState, gameRulesLibrary);
 
-  const lostTerminal = isTerminal && (opponentScore > myScore);
-  const reachedMax = (opponentScore === 100);
+  // lost if any opponent has a higher score and terminal state
+  const lostTerminal = isTerminal && this.opponentRoles.some(role =>
+    findreward(role, gameState, gameRulesLibrary) > findreward(playerRole, gameState, gameRulesLibrary)
+  );
+
+  const reachedMax = opponentScores.some(s => s === 100);
   const safeFlag = (lostTerminal || reachedMax) ? 0 : 1;
-  const scoreDiff = myScore - opponentScore;
+  const scoreDiff = myScore - maxOpponent;
 
   return [safeFlag, scoreDiff];
 }
@@ -315,15 +322,16 @@ function findLosingMoves(state) {
 
     // Check if any opponent move leads to immediate win
     const hasOpponentWin = oppMoves.some(oppMove => {
-      let oppState;
-      if (interpreter === 'symbol') {
-        oppState = simulate(oppMove, nextState, gameRulesLibrary);
-      } else {
-        oppState = definemorefacts([], simulate(oppMove, nextState, gameRulesLibrary));
-      }
+      let oppState = interpreter === 'symbol'
+        ? simulate(oppMove, nextState, gameRulesLibrary)
+        : definemorefacts([], simulate(oppMove, nextState, gameRulesLibrary));
 
-      return findterminalp(oppState, gameRulesLibrary) &&
-             findreward(playerRole, oppState, gameRulesLibrary) === 0;
+      if (!findterminalp(oppState, gameRulesLibrary)) return false;
+
+      const myScore = findreward(playerRole, oppState, gameRulesLibrary);
+      const maxOpponentScore = Math.max(...opponentRoles.map(r => findreward(r, oppState, gameRulesLibrary)));
+
+      return maxOpponentScore > myScore;
     });
 
     if (hasOpponentWin) {
@@ -363,15 +371,15 @@ class AlphaBetaSearchEngine {
   constructor(role, rulesLibrary, options = {}) {
     this.playerRole = role;
     this.rulesLibrary = rulesLibrary;
-    this.opponentRole = findroles(rulesLibrary).find(r => r !== role);
+    this.opponentRoles = findroles(rules).filter(r => r !== role); // stores list of all opponent roles
     this.useSymbolized = options.useSymbolized || false;
     this.rootState = null;
     this.chosenMove = null;
     this.searchDepth = 1; // Track current search depth for background processing
   }
 
-  getOpponentRole() {
-    return this.opponentRole;
+  getOpponentRoles() {
+    return this.opponentRoles;
   }
 
   initializeRoot(state) {
@@ -504,7 +512,7 @@ class AlphaBetaSearchEngine {
         const nextFacts = simulate(move, state, this.rulesLibrary);
         ns = definemorefacts([], nextFacts);
       }
-      return findreward(this.opponentRole, ns, this.rulesLibrary) !== 100;
+      return findreward(this.opponentRoles, ns, this.rulesLibrary) !== 100;
     });
 
     const candidateMoves = safeMoves.length > 0 ? safeMoves : allMoves;
@@ -547,7 +555,9 @@ class AlphaBetaSearchEngine {
     }
 
     const myScore = findreward(playerRole, state, gameRulesLibrary);
-    const opponentScore = findreward(this.getOpponentRole(), state, gameRulesLibrary);
+
+    const opponentScore = Math.max(...this.opponentRoles.map(r => findreward(r, gameState, this.rulesLibrary)));
+
     const isTerminal = findterminalp(state, this.rulesLibrary);
 
     if (opponentScore === 100 || (isTerminal && opponentScore > myScore)) {
@@ -566,7 +576,7 @@ class AlphaBetaSearchEngine {
         const nextFacts = simulate(move, state, this.rulesLibrary);
         ns = definemorefacts([], nextFacts);
       }
-      return findreward(this.getOpponentRole(), ns, this.rulesLibrary) !== 100;
+      return findreward(this.getOpponentRoles(), ns, this.rulesLibrary) !== 100;
     });
 
     if (legalActions.length === 0) {
@@ -646,11 +656,11 @@ for (const d of DEPTH_CANDIDATES)
 
 // ===== Global context for heuristics =====================================
 let globalPlayerRole = null;
-let globalOpponentRole = null;
+let globalOpponentRoles = null;
 let globalRulesLibrary = null;
-function _setGlobalContext(role, opp, rules) {
+function _setGlobalContext(role, opps, rules) {
   globalPlayerRole = role;
-  globalOpponentRole = opp;
+  globalOpponentRoles = opps;
   globalRulesLibrary = rules;
 }
 
@@ -660,19 +670,30 @@ function safeLegals(state, rules) {
   return Array.isArray(mv) ? mv : [];
 }
 
-// ===== Heuristic definitions (unchanged) =================================
-function myScoreHeuristic(s) { return findreward(globalPlayerRole, s, globalRulesLibrary); }
+// ===== Heuristic definitions (updated for 2+ players) =================================
+function myScoreHeuristic(s) { 
+  return findreward(globalPlayerRole, s, globalRulesLibrary); 
+}
+
 function myMobilityHeuristic(s) {
   if (typeof findcontrol !== 'function') return 0;
   return findcontrol(s, globalRulesLibrary) === globalPlayerRole
     ? safeLegals(s, globalRulesLibrary).length : 0;
 }
-function opponentScoreHeuristic(s) { return -findreward(globalOpponentRole, s, globalRulesLibrary); }
+
+// highest score opponent
+function opponentScoreHeuristic(s) {
+  return -Math.max(...globalOpponentRoles.map(r => findreward(r, s, globalRulesLibrary)));
+}
+
 function opponentMobilityHeuristic(s) {
   if (typeof findcontrol !== 'function') return 0;
-  return findcontrol(s, globalRulesLibrary) === globalOpponentRole
-    ? -safeLegals(s, globalRulesLibrary).length : 0;
+  return -globalOpponentRoles.reduce((total, role) => {
+    return total + (findcontrol(s, globalRulesLibrary) === role
+      ? safeLegals(s, globalRulesLibrary).length : 0);
+  }, 0);
 }
+
 function pieceCountHeuristic(s) {
   if (interpreter === 'symbol') {
     // Handle symbolized states
@@ -688,6 +709,7 @@ function pieceCountHeuristic(s) {
     return s.reduce((c, f) => Array.isArray(f) && f.includes(globalPlayerRole) ? c + 1 : c, 0);
   }
 }
+
 function immediateWinThreatHeuristic(s) {
   if (findterminalp(s, globalRulesLibrary))
     return myScoreHeuristic(s) > opponentScoreHeuristic(s) ? 1 : 0;
@@ -699,36 +721,37 @@ function immediateWinThreatHeuristic(s) {
     } else {
       ns = definemorefacts([], simulate(m, s, globalRulesLibrary));
     }
-    return findterminalp(ns, globalRulesLibrary) && findreward(globalPlayerRole, ns, globalRulesLibrary) === 100;
+    return findterminalp(ns, globalRulesLibrary) && findreward(globalPlayerRoles, ns, globalRulesLibrary) === 100;
   }).length;
 }
+
 function immediateLossThreatHeuristic(s) {
   if (findterminalp(s, globalRulesLibrary))
-    return opponentScoreHeuristic(s) > myScoreHeuristic(s) ? -1 : 0;
+    return globalOpponentRoles.some(r => findreward(r, s, globalRulesLibrary) > findreward(globalPlayerRole, s, globalRulesLibrary)) ? -1 : 0;
 
   return -safeLegals(s, globalRulesLibrary).filter(m => {
-    let ns;
-    if (interpreter === 'symbol') {
-      ns = simulate(m, s, globalRulesLibrary);
-    } else {
-      ns = definemorefacts([], simulate(m, s, globalRulesLibrary));
-    }
-    return findterminalp(ns, globalRulesLibrary) && findreward(globalOpponentRole, ns, globalRulesLibrary) === 100;
+    let ns = interpreter === 'symbol'
+      ? simulate(m, s, globalRulesLibrary)
+      : definemorefacts([], simulate(m, s, globalRulesLibrary));
+    
+    return findterminalp(ns, globalRulesLibrary) && 
+           globalOpponentRoles.some(r => findreward(r, ns, globalRulesLibrary) === 100);
   }).length;
 }
+
 function opponentPieceCountHeuristic(s) {
   if (interpreter === 'symbol') {
     // Handle symbolized states
     let count = 0;
     for (const key in s) {
-      if (s[key] === true && key.indexOf(globalOpponentRole) >= 0) {
+      if (s[key] === true && globalOpponentRoles.some(r => key.includes(r))) {
         count++;
       }
     }
     return -count;
   } else {
     // Handle regular states
-    return -s.reduce((c, f) => Array.isArray(f) && f.includes(globalOpponentRole) ? c + 1 : c, 0);
+    return -s.reduce((c, f) => Array.isArray(f) && globalOpponentRoles.some(r => f.includes(r)) ? c + 1 : c, 0);
   }
 }
 
@@ -797,7 +820,7 @@ class MonteCarloTreeSearchEngine {
   constructor(role, rules, opt = {}) {
     this.playerRole = role;
     this.rulesLibrary = rules;
-    this.opponentRole = findroles(rules).find(r => r !== role);
+    this.opponentRoles = findroles(rules).filter(r => r !== role);
     this.useIterativeWidening = Boolean(opt.useIterativeWidening);
     this.useSymbolized = Boolean(opt.useSymbolized);
     this.useUCT = Boolean(opt.useUCT);
@@ -807,7 +830,7 @@ class MonteCarloTreeSearchEngine {
     this.rollDepth = 3;      // per-turn override
     this.rollPDeep = 0.1;    // per-turn override
     this.activeArmIdx = 0;
-    _setGlobalContext(role, this.opponentRole, rules);
+    _setGlobalContext(role, this.opponentRoles, rules);
   }
 
   // ---- node factory -----------------------------------------------------
@@ -836,8 +859,8 @@ class MonteCarloTreeSearchEngine {
     return this.root ? this.root.gameState : null;
   }
 
-  getOpponentRole() {
-    return this.opponentRole;
+  getOpponentRoles() {
+    return this.opponentRoles;
   }
 
   processOpponentMove(oppMove) {
@@ -1324,7 +1347,6 @@ Identifier: <span id='player'>Lemur</span> <img src="http://gamemaster.stanford.
 <br/>
 
 <!--=======================================================================-->
-
 <center>
   <br/>
   <textarea id='transcript' style='font-family:courier' rows='30' cols='80' readonly></textarea>
