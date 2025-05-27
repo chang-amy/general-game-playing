@@ -1,0 +1,1343 @@
+<html>
+
+<!--=======================================================================-->
+
+<head>
+  <title>Lemur</title>
+  <script type="text/javascript" src="http://epilog.stanford.edu/javascript/epilog.js"></script>
+  <script type="text/javascript" src="http://gamemaster.stanford.edu/javascript/localstorage.js"></script>
+  <script type='text/javascript' src='http://gamemaster.stanford.edu/interpreter/general.js'></script>
+  <script type="text/javascript" src="http://gamemaster.stanford.edu/metagaming/grounder.js"></script>
+  <script type="text/javascript" src="http://gamemaster.stanford.edu/metagaming/symbolizer.js"></script>
+  <script type="text/javascript" src="http://gamemaster.stanford.edu/metagaming/simplifier.js"></script>
+  <script type="text/javascript" src="http://gamemaster.stanford.edu/gameplaying/pts.js"></script>
+  <script type="text/javascript" src='http://gamemaster.stanford.edu/metagaming/pruner.js'></script>
+  <script type='text/javascript'>
+
+
+
+// ==================== Ultimate Lemur Player ====================
+//
+// PLayer has been updated to include pruning. Results are as follows:
+//
+// Hunter: Score 87 with and without pruning, but with pruning
+// Lemur efficiently solves hunter on one board rather
+// than playing all three boards haphazardly.
+//
+// Buttons: Lemur wins with pruning but fails to find the solution otherwise.
+//
+// Knight-through: Benchmarked against MCS. Won cleanly on one board
+// for all trials with pruning. Appeared to be roughly a coinflip
+// without pruning.
+//
+// tictactoe/suicide: Benchmarked against MCS. Won cleanly and fairly consistently
+// with pruning, however, there were occasional issues due to pruning causing
+// Lemur to not block winning moves on other boards. Without pruning was messy and
+// appeared to be roughly a coinflip.
+//
+// -------------------------------------------------------------
+// Configuration
+// -------------------------------------------------------------
+
+const BRANCH_FACTOR_SWITCH_THRESHOLD = 4;          // switch from Alpha-Beta to MCTS
+const BRANCH_FACTOR_WIDENING_THRESHOLD = 2000;        // enable iterative widening above this
+const SAFETY_BUFFER_MILLISECONDS = 1500;            // network / GC head-room
+const PUCT_EXPLORATION_CONSTANT = 1.00;             // PUCT exploration parameter
+const UCT_EXPLORATION_CONSTANT = 2.00;              // UCT exploration parameter
+const HEURISTIC_UCB_EXPLORATION_CONST = 0.30;       // for bandit algorithm
+const ITERATIVE_WIDENING_EXPONENT = 0.50;           // controls expansion rate
+const USE_BACKGROUND_PROCESSING = false;            // use opponent's thinking time
+const USE_REWARD_RESCALING = true;                  // rescale rewards from [0,100] to [-1,1]
+const USE_LOSING_MOVE_PRUNING = false;               // prune moves that lead to immediate loss
+const USE_PREPROCESSING_PIPELINE = true;            // use preprocessing pipeline
+const USE_HYBRID_INTERPRETER = true;                // use hybrid interpreter for symbolized rules
+const USE_IMMEDIATE_WIN_DETECTION = false;           // immediately take winning moves when found
+
+// -------------------------------------------------------------
+// Game State Globals
+// -------------------------------------------------------------
+let playerRole;
+let gameRulesLibrary;
+let startClockSeconds;
+let playClockSeconds;
+let selectedEngine;
+let interpreter = 'general';
+var manager = 'manager';
+var player = 'lemur';
+
+// -------------------------------------------------------------
+// GGP Interface
+// -------------------------------------------------------------
+
+function ping() {
+  return 'ready';
+}
+
+function start(role, ruleSet, startClock, playClock) {
+  playerRole = role;
+  startClockSeconds = parseInt(startClock, 10);
+  playClockSeconds = parseInt(playClock, 10);
+
+  // Process rules through comprehensive preprocessing pipeline
+  if (USE_PREPROCESSING_PIPELINE) {
+    let rules = ruleSet.slice(1);
+
+    // Step 1: Optimize rule structure by ordering and pruning subgoals
+    if (typeof prunerulesubgoals === 'function') {
+      rules = prunerulesubgoals(rules);
+    }
+    if (typeof prunerules === 'function') {
+      rules = prunerules(rules);
+    }
+    if (typeof fixrules === 'function') {
+      rules = fixrules(rules);
+    }
+
+    // Prepare for next steps
+    rules = definemorerules([], rules);
+
+    // Step 2: Ground the rules with a deadline
+    let groundedRules = null;
+    if (typeof groundrules === 'function') {
+      try {
+        groundedRules = groundrules(rules, (startClockSeconds - 5) * 1000);
+      } catch (e) {
+        console.log("Grounding failed: " + e);
+      }
+    }
+
+    // Step 3-5: If grounding succeeded, symbolize, simplify, and prune
+    if (groundedRules) {
+      if (typeof symbolizerules === 'function') {
+        rules = symbolizerules(groundedRules);
+        interpreter = USE_HYBRID_INTERPRETER ? 'symbol' : 'general';
+      }
+
+      if (typeof simplifyrules === 'function') {
+        rules = simplifyrules(rules);
+      }
+
+      // Redefine rules
+      rules = definemorerules([], rules);
+      rules = pruneprogram(role, rules);
+
+
+      gameRulesLibrary = definemorerules([], rules);
+    } else {
+      // Fall back to original rules if preprocessing failed
+      gameRulesLibrary = definemorerules([], ruleSet.slice(1));
+    }
+  } else {
+    // Use original rules without preprocessing
+    gameRulesLibrary = definemorerules([], ruleSet.slice(1));
+  }
+
+  // Initialize state
+  const initialFacts = findinits(gameRulesLibrary);
+  const initialState = interpreter === 'symbol' ? initialFacts : definemorefacts([], initialFacts);
+
+  // Select engine based on game complexity
+  const legalMoves = findlegals(initialState, gameRulesLibrary);
+  const branchingFactor = legalMoves.length;
+
+  if (branchingFactor > BRANCH_FACTOR_SWITCH_THRESHOLD) {
+    const useIterativeWidening = branchingFactor > BRANCH_FACTOR_WIDENING_THRESHOLD;
+    selectedEngine = new MonteCarloTreeSearchEngine(
+      playerRole,
+      gameRulesLibrary,
+      {
+        useIterativeWidening: useIterativeWidening,
+        useSymbolized: (interpreter === 'symbol')
+      }
+    );
+  } else {
+    selectedEngine = new AlphaBetaSearchEngine(
+      playerRole,
+      gameRulesLibrary,
+      { useSymbolized: (interpreter === 'symbol') }
+    );
+  }
+
+  selectedEngine.initializeRoot(initialState);
+
+  // Use remaining start clock for background processing
+  const deadline = Date.now() + (startClockSeconds * 1000) - SAFETY_BUFFER_MILLISECONDS;
+  while (Date.now() < deadline) {
+    selectedEngine.continueSearch();
+  }
+
+  return 'ready';
+}
+
+function play(opponentMove) {
+  // Handle symbolization if needed
+  if (interpreter === 'symbol' && opponentMove !== 'nil' && typeof symbolizeatom === 'function') {
+    opponentMove = symbolizeatom(opponentMove);
+  }
+
+  if (opponentMove !== 'nil') {
+    // Process the opponent's move
+    selectedEngine.processOpponentMove(opponentMove);
+  }
+
+  // FEATURE: Quick win detection before regular search
+  if (USE_IMMEDIATE_WIN_DETECTION) {
+    const currentState = selectedEngine.getCurrentState();
+    if (findcontrol(currentState, gameRulesLibrary) === playerRole) {
+      const winningMove = findWinningMove(currentState);
+      if (winningMove) {
+        console.log("Found immediate winning move!");
+        // Convert from symbolized move if needed
+        if (interpreter === 'symbol' && typeof unsymbolizeatom === 'function') {
+          return unsymbolizeatom(winningMove);
+        }
+        return winningMove;
+      }
+    }
+  }
+
+  // Utilize opponent's thinking time if it's not our turn
+  if (USE_BACKGROUND_PROCESSING) {
+    const currentState = selectedEngine.getCurrentState();
+    const deadline = Date.now() + (playClockSeconds - 2) * 1000;
+
+    while (findcontrol(currentState, gameRulesLibrary) !== playerRole && Date.now() < deadline) {
+      selectedEngine.continueSearch();
+      if (opponentMove === 'nil') break; // Exit if we have no opponent move context
+    }
+  }
+
+  // Get the best move
+  let move = selectedEngine.selectMove();
+
+  // Convert back from symbolized move if needed
+  if (interpreter === 'symbol' && move !== 'nil' && typeof unsymbolizeatom === 'function') {
+    move = unsymbolizeatom(move);
+  }
+
+  return move;
+}
+
+function stop() {
+  return selectedEngine.stop();
+}
+
+function abort() {
+  return selectedEngine.abort();
+}
+
+// -------------------------------------------------------------
+// Utility Functions
+// -------------------------------------------------------------
+
+/**
+ * Helper function to find immediate winning moves
+ */
+function findWinningMove(state) {
+  if (!USE_IMMEDIATE_WIN_DETECTION) return null;
+
+  const legalMoves = findlegals(state, gameRulesLibrary);
+
+  for (const move of legalMoves) {
+    let nextState;
+    if (interpreter === 'symbol') {
+      nextState = simulate(move, state, gameRulesLibrary);
+    } else {
+      nextState = definemorefacts([], simulate(move, state, gameRulesLibrary));
+    }
+
+    if (findterminalp(nextState, gameRulesLibrary) &&
+        findreward(playerRole, nextState, gameRulesLibrary) === 100) {
+      return move;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Lexicographic comparison of two evaluation tuples [safeFlag, scoreDifference].
+ * Returns 1 if a > b, -1 if a < b, or 0 if equal.
+ */
+function compareLexicographically(a, b) {
+  const length = Math.min(a.length, b.length);
+  for (let index = 0; index < length; index++) {
+    if (a[index] > b[index]) return 1;
+    if (a[index] < b[index]) return -1;
+  }
+  return 0;
+}
+
+/**
+ * Zero-sum lexicographic static evaluation: [safeFlag, myScore - opponentScore].
+ */
+function evaluateLexZeroSum(gameState) {
+  const myScore = findreward(playerRole, gameState, gameRulesLibrary);
+  const opponentRole = selectedEngine.getOpponentRole();
+  const opponentScore = findreward(opponentRole, gameState, gameRulesLibrary);
+  const isTerminal = findterminalp(gameState, gameRulesLibrary);
+
+  const lostTerminal = isTerminal && (opponentScore > myScore);
+  const reachedMax = (opponentScore === 100);
+  const safeFlag = (lostTerminal || reachedMax) ? 0 : 1;
+  const scoreDiff = myScore - opponentScore;
+
+  return [safeFlag, scoreDiff];
+}
+
+/**
+ * Rescale rewards from [0,100] to [-1,1]
+ * Helps address undervaluation of losses in MCTS backpropagation
+ */
+function rescaleReward(reward) {
+  if (!USE_REWARD_RESCALING) return reward;
+  return (reward - 50) / 50; // Converts 0->-1, 50->0, 100->1
+}
+
+/**
+ * Identify moves that would allow opponent to win on next turn
+ */
+function findLosingMoves(state) {
+  if (!USE_LOSING_MOVE_PRUNING) return null;
+
+  const myMoves = findlegals(state, gameRulesLibrary);
+  const losingMoves = [];
+
+  for (const move of myMoves) {
+    let nextState;
+    if (interpreter === 'symbol') {
+      nextState = simulate(move, state, gameRulesLibrary);
+    } else {
+      nextState = definemorefacts([], simulate(move, state, gameRulesLibrary));
+    }
+
+    const oppMoves = findlegals(nextState, gameRulesLibrary);
+
+    // Check if any opponent move leads to immediate win
+    const hasOpponentWin = oppMoves.some(oppMove => {
+      let oppState;
+      if (interpreter === 'symbol') {
+        oppState = simulate(oppMove, nextState, gameRulesLibrary);
+      } else {
+        oppState = definemorefacts([], simulate(oppMove, nextState, gameRulesLibrary));
+      }
+
+      return findterminalp(oppState, gameRulesLibrary) &&
+             findreward(playerRole, oppState, gameRulesLibrary) === 0;
+    });
+
+    if (hasOpponentWin) {
+      losingMoves.push(move);
+    }
+  }
+
+  // Only return losing moves if there are some (but not all) moves that are safe
+  return losingMoves.length > 0 && losingMoves.length < myMoves.length ? losingMoves : null;
+}
+
+/**
+ * Remove losing moves from legal actions
+ */
+function pruneLosingMoves(actions, losingMoves) {
+  if (!losingMoves) return actions;
+
+  return actions.filter(action => {
+    return !losingMoves.some(losingMove => equalp(action, losingMove));
+  });
+}
+
+function shuffleArray(arr) {
+  if (!Array.isArray(arr)) return [];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// -------------------------------------------------------------
+// Engine 1: Alpha-Beta Search with Iterative Deepening
+// -------------------------------------------------------------
+
+class AlphaBetaSearchEngine {
+  constructor(role, rulesLibrary, options = {}) {
+    this.playerRole = role;
+    this.rulesLibrary = rulesLibrary;
+    this.opponentRole = findroles(rulesLibrary).find(r => r !== role);
+    this.useSymbolized = options.useSymbolized || false;
+    this.rootState = null;
+    this.chosenMove = null;
+    this.searchDepth = 1; // Track current search depth for background processing
+  }
+
+  getOpponentRole() {
+    return this.opponentRole;
+  }
+
+  initializeRoot(state) {
+    this.rootState = state;
+    this.chosenMove = null;
+  }
+
+  getCurrentState() {
+    return this.rootState;
+  }
+
+  processOpponentMove(opponentMove) {
+    if (opponentMove !== 'nil') {
+      if (this.useSymbolized) {
+        this.rootState = simulate(opponentMove, this.rootState, this.rulesLibrary);
+      } else {
+        const nextFacts = simulate(opponentMove, this.rootState, this.rulesLibrary);
+        this.rootState = definemorefacts([], nextFacts);
+      }
+    }
+  }
+
+  // Support continuous search (for background processing)
+  continueSearch() {
+    if (findcontrol(this.rootState, this.rulesLibrary) !== this.playerRole) return;
+
+    const deadline = Date.now() + 100; // Small time increment
+    const result = this.searchAtDepth(this.rootState, this.searchDepth, deadline);
+
+    if (result.move !== false) {
+      this.chosenMove = result.move;
+      this.searchDepth++; // Increase depth for next iteration
+    }
+  }
+
+  selectMove() {
+    // FEATURE: First check for immediate winning moves
+    if (USE_IMMEDIATE_WIN_DETECTION) {
+      const winningMove = findWinningMove(this.rootState);
+      if (winningMove) {
+        return winningMove;
+      }
+    }
+
+    this.searchDepth = 1; // Reset depth counter
+    const deadline = Date.now() + (playClockSeconds - 2) * 1000;
+    this.performIterativeDeepening(deadline);
+    return this.chosenMove;
+  }
+
+  play(opponentMove) {
+    this.processOpponentMove(opponentMove);
+    return this.selectMove();
+  }
+
+  stop() {
+    return false;
+  }
+
+  abort() {
+    return false;
+  }
+
+  performIterativeDeepening(deadline) {
+    let lastMove = null;
+
+    for (let searchDepth = 1;; searchDepth++) {
+      const result = this.searchAtDepth(
+        this.rootState,
+        searchDepth,
+        deadline
+      );
+      if (result.move === false) {
+        break; // out of time
+      }
+      lastMove = result.move;
+      this.chosenMove = result.move;
+
+      if (result.value[0] === 0) {
+        break; // forced loss detected
+      }
+      if (Date.now() >= deadline) {
+        break;
+      }
+    }
+
+    if (this.chosenMove === null) {
+      this.chosenMove = lastMove;
+    }
+  }
+
+  searchAtDepth(state, maxDepth, deadline) {
+    if (Date.now() >= deadline) {
+      return { move: false };
+    }
+
+    // Get all legal moves
+    let allMoves = findlegals(state, this.rulesLibrary);
+
+    // FEATURE: Quick check for winning moves
+    if (USE_IMMEDIATE_WIN_DETECTION) {
+      for (const move of allMoves) {
+        let nextState;
+        if (this.useSymbolized) {
+          nextState = simulate(move, state, this.rulesLibrary);
+        } else {
+          const nextFacts = simulate(move, state, this.rulesLibrary);
+          nextState = definemorefacts([], nextFacts);
+        }
+
+        if (findterminalp(nextState, this.rulesLibrary) &&
+            findreward(this.playerRole, nextState, this.rulesLibrary) === 100) {
+          return { move: move, value: [1, 100] };
+        }
+      }
+    }
+
+    // Prune losing moves if not all moves are losing
+    const losingMoves = findLosingMoves(state);
+    if (losingMoves !== null) {
+      allMoves = pruneLosingMoves(allMoves, losingMoves);
+    }
+
+    // Further prune moves giving opponent immediate 100
+    const safeMoves = allMoves.filter(move => {
+      let ns;
+      if (this.useSymbolized) {
+        ns = simulate(move, state, this.rulesLibrary);
+      } else {
+        const nextFacts = simulate(move, state, this.rulesLibrary);
+        ns = definemorefacts([], nextFacts);
+      }
+      return findreward(this.opponentRole, ns, this.rulesLibrary) !== 100;
+    });
+
+    const candidateMoves = safeMoves.length > 0 ? safeMoves : allMoves;
+
+    let bestValue = [-Infinity, -Infinity];
+    let bestMove = null;
+
+    for (const action of candidateMoves) {
+      let nextState;
+      if (this.useSymbolized) {
+        nextState = simulate(action, state, this.rulesLibrary);
+      } else {
+        const nextFacts = simulate(action, state, this.rulesLibrary);
+        nextState = definemorefacts([], nextFacts);
+      }
+
+      const value = this.minimax(
+        nextState,
+        maxDepth - 1,
+        [-Infinity, -Infinity],
+        [Infinity, Infinity],
+        deadline
+      );
+
+      if (value === false) {
+        return { move: false };
+      }
+      if (compareLexicographically(value, bestValue) > 0) {
+        bestValue = value;
+        bestMove = action;
+      }
+    }
+
+    return { move: bestMove, value: bestValue };
+  }
+
+  minimax(state, depth, alpha, beta, deadline) {
+    if (Date.now() >= deadline) {
+      return false;
+    }
+
+    const myScore = findreward(playerRole, state, gameRulesLibrary);
+    const opponentScore = findreward(this.getOpponentRole(), state, gameRulesLibrary);
+    const isTerminal = findterminalp(state, this.rulesLibrary);
+
+    if (opponentScore === 100 || (isTerminal && opponentScore > myScore)) {
+      return [0, myScore - opponentScore];
+    }
+    if (depth === 0 || isTerminal) {
+      return evaluateLexZeroSum(state);
+    }
+
+    const controllingRole = findcontrol(state, this.rulesLibrary);
+    let legalActions = findlegals(state, this.rulesLibrary).filter(move => {
+      let ns;
+      if (this.useSymbolized) {
+        ns = simulate(move, state, this.rulesLibrary);
+      } else {
+        const nextFacts = simulate(move, state, this.rulesLibrary);
+        ns = definemorefacts([], nextFacts);
+      }
+      return findreward(this.getOpponentRole(), ns, this.rulesLibrary) !== 100;
+    });
+
+    if (legalActions.length === 0) {
+      legalActions = findlegals(state, this.rulesLibrary);
+    }
+
+    if (controllingRole === this.playerRole) {
+      let best = [-Infinity, -Infinity];
+      for (const action of legalActions) {
+        let nextState;
+        if (this.useSymbolized) {
+          nextState = simulate(action, state, this.rulesLibrary);
+        } else {
+          const nextFacts = simulate(action, state, this.rulesLibrary);
+          nextState = definemorefacts([], nextFacts);
+        }
+
+        const value = this.minimax(nextState, depth - 1, alpha, beta, deadline);
+
+        if (value === false) {
+          return false;
+        }
+        if (compareLexicographically(value, best) > 0) {
+          best = value;
+        }
+        if (compareLexicographically(value, alpha) > 0) {
+          alpha = value;
+        }
+        if (compareLexicographically(alpha, beta) >= 0) {
+          break;
+        }
+      }
+      return best;
+    } else {
+      let worst = [Infinity, Infinity];
+      for (const action of legalActions) {
+        let nextState;
+        if (this.useSymbolized) {
+          nextState = simulate(action, state, this.rulesLibrary);
+        } else {
+          const nextFacts = simulate(action, state, this.rulesLibrary);
+          nextState = definemorefacts([], nextFacts);
+        }
+
+        const value = this.minimax(nextState, depth - 1, alpha, beta, deadline);
+
+        if (value === false) {
+          return false;
+        }
+        if (compareLexicographically(value, worst) < 0) {
+          worst = value;
+        }
+        if (compareLexicographically(alpha, worst) >= 0) {
+          break;
+        }
+        if (compareLexicographically(worst, beta) < 0) {
+          beta = worst;
+        }
+      }
+      return worst;
+    }
+  }
+}
+
+// -------------------------------------------------------------
+// MCTS Code
+// -------------------------------------------------------------
+
+// ---- candidate grids for rollout parameters -----------------------------
+const DEPTH_CANDIDATES = [2,3,5,10,20];              // shallow depths to test
+const PDEEP_CANDIDATES = [0.8, 0.9, 1];     // deep-roll probabilities
+
+const PARAM_ARMS = [];
+for (const d of DEPTH_CANDIDATES)
+  for (const p of PDEEP_CANDIDATES)
+    PARAM_ARMS.push({ depth: d, pDeep: p });
+
+// ===== Global context for heuristics =====================================
+let globalPlayerRole = null;
+let globalOpponentRole = null;
+let globalRulesLibrary = null;
+function _setGlobalContext(role, opp, rules) {
+  globalPlayerRole = role;
+  globalOpponentRole = opp;
+  globalRulesLibrary = rules;
+}
+
+// ===== Safe helpers ======================================================
+function safeLegals(state, rules) {
+  const mv = findlegals(state, rules);
+  return Array.isArray(mv) ? mv : [];
+}
+
+// ===== Heuristic definitions (unchanged) =================================
+function myScoreHeuristic(s) { return findreward(globalPlayerRole, s, globalRulesLibrary); }
+function myMobilityHeuristic(s) {
+  if (typeof findcontrol !== 'function') return 0;
+  return findcontrol(s, globalRulesLibrary) === globalPlayerRole
+    ? safeLegals(s, globalRulesLibrary).length : 0;
+}
+function opponentScoreHeuristic(s) { return -findreward(globalOpponentRole, s, globalRulesLibrary); }
+function opponentMobilityHeuristic(s) {
+  if (typeof findcontrol !== 'function') return 0;
+  return findcontrol(s, globalRulesLibrary) === globalOpponentRole
+    ? -safeLegals(s, globalRulesLibrary).length : 0;
+}
+function pieceCountHeuristic(s) {
+  if (interpreter === 'symbol') {
+    // Handle symbolized states
+    let count = 0;
+    for (const key in s) {
+      if (s[key] === true && key.indexOf(globalPlayerRole) >= 0) {
+        count++;
+      }
+    }
+    return count;
+  } else {
+    // Handle regular states
+    return s.reduce((c, f) => Array.isArray(f) && f.includes(globalPlayerRole) ? c + 1 : c, 0);
+  }
+}
+function immediateWinThreatHeuristic(s) {
+  if (findterminalp(s, globalRulesLibrary))
+    return myScoreHeuristic(s) > opponentScoreHeuristic(s) ? 1 : 0;
+
+  return safeLegals(s, globalRulesLibrary).filter(m => {
+    let ns;
+    if (interpreter === 'symbol') {
+      ns = simulate(m, s, globalRulesLibrary);
+    } else {
+      ns = definemorefacts([], simulate(m, s, globalRulesLibrary));
+    }
+    return findterminalp(ns, globalRulesLibrary) && findreward(globalPlayerRole, ns, globalRulesLibrary) === 100;
+  }).length;
+}
+function immediateLossThreatHeuristic(s) {
+  if (findterminalp(s, globalRulesLibrary))
+    return opponentScoreHeuristic(s) > myScoreHeuristic(s) ? -1 : 0;
+
+  return -safeLegals(s, globalRulesLibrary).filter(m => {
+    let ns;
+    if (interpreter === 'symbol') {
+      ns = simulate(m, s, globalRulesLibrary);
+    } else {
+      ns = definemorefacts([], simulate(m, s, globalRulesLibrary));
+    }
+    return findterminalp(ns, globalRulesLibrary) && findreward(globalOpponentRole, ns, globalRulesLibrary) === 100;
+  }).length;
+}
+function opponentPieceCountHeuristic(s) {
+  if (interpreter === 'symbol') {
+    // Handle symbolized states
+    let count = 0;
+    for (const key in s) {
+      if (s[key] === true && key.indexOf(globalOpponentRole) >= 0) {
+        count++;
+      }
+    }
+    return -count;
+  } else {
+    // Handle regular states
+    return -s.reduce((c, f) => Array.isArray(f) && f.includes(globalOpponentRole) ? c + 1 : c, 0);
+  }
+}
+
+const ALL_HEURISTICS = [
+  myScoreHeuristic, myMobilityHeuristic, opponentScoreHeuristic, opponentMobilityHeuristic,
+  pieceCountHeuristic, immediateWinThreatHeuristic, immediateLossThreatHeuristic, opponentPieceCountHeuristic
+];
+
+// ===== Meta-Bandit A: heuristic weights ==================================
+class HeuristicSelector {
+  constructor() {
+    this.v = Array(ALL_HEURISTICS.length).fill(0);
+    this.r = Array(ALL_HEURISTICS.length).fill(0);
+    this.n = 0;
+    this.bias = [60, 20, 50, 60, 20, 120, 120, 25];
+  }
+  select() {
+    this.n++;
+    // compute UCB1 scores
+    const scores = this.v.map((visits, i) => {
+      return visits
+        ? this.r[i] / visits + HEURISTIC_UCB_EXPLORATION_CONST * Math.sqrt(Math.log(this.n) / visits)
+        : Infinity;
+    });
+    // pick best arm
+    const best = scores.reduce((b, scr, i) => scr > b.scr ? { idx: i, scr } : b
+      , { idx: 0, scr: -1 });
+    return best.idx;
+  }
+  record(i, val) {
+    this.v[i]++;
+    this.r[i] += val;
+  }
+  weights() {
+    const c = this.v.map((x, i) => x + this.bias[i]);
+    const sum = c.reduce((a, b) => a + b, 0) || 1;
+    const w = c.map(x => x / sum);
+    return w;
+  }
+}
+const heuristicSelector = new HeuristicSelector();
+
+// ===== Meta-Bandit B: rollout parameters (depth, pDeep) ==================
+const armStats = PARAM_ARMS.map(() => ({ v: 0, r: 0 }));
+let totalArmTrials = 0;
+function selectParamArm() {
+  totalArmTrials++;
+  // compute UCB1 scores for each rollout arm
+  const scores = armStats.map((st, i) => {
+    return st.v
+      ? st.r / st.v + 0.4 * Math.sqrt(Math.log(totalArmTrials) / st.v)
+      : Infinity;
+  });
+  const best = scores.reduce((b, scr, i) => scr > b.scr ? { idx: i, scr } : b
+    , { idx: 0, scr: -1 });
+  return best.idx;
+}
+function recordParamArm(i, val) {
+  armStats[i].v++;
+  armStats[i].r += val;
+
+}
+
+// ===== MCTS Engine =======================================================
+class MonteCarloTreeSearchEngine {
+  constructor(role, rules, opt = {}) {
+    this.playerRole = role;
+    this.rulesLibrary = rules;
+    this.opponentRole = findroles(rules).find(r => r !== role);
+    this.useIterativeWidening = Boolean(opt.useIterativeWidening);
+    this.useSymbolized = Boolean(opt.useSymbolized);
+    this.useUCT = Boolean(opt.useUCT);
+    this.iwExp = ITERATIVE_WIDENING_EXPONENT;
+    this.root = null;
+    this.deadline = 0;
+    this.rollDepth = 3;      // per-turn override
+    this.rollPDeep = 0.1;    // per-turn override
+    this.activeArmIdx = 0;
+    _setGlobalContext(role, this.opponentRole, rules);
+  }
+
+  // ---- node factory -----------------------------------------------------
+  _node(s, p) {
+    return {
+      gameState: s,
+      visit: p ? 0 : 1,
+      val: 0,
+      children: [],
+      unexp: shuffleArray(safeLegals(s, this.rulesLibrary)),
+      par: p,
+      act: null,
+      prior: 1
+    };
+  }
+
+  initializeRoot(init) {
+    this.root = this._node(init, null);
+    this._initRootPriors();
+
+    // Ensure all root children have at least one rollout
+    this._ensureRootCoverage();
+  }
+
+  getCurrentState() {
+    return this.root ? this.root.gameState : null;
+  }
+
+  getOpponentRole() {
+    return this.opponentRole;
+  }
+
+  processOpponentMove(oppMove) {
+    if (oppMove !== 'nil' && this.root) {
+      const c = this.root.children.find(k => equalp(k.act, oppMove));
+      if (c) {
+        this.root = c;
+      } else {
+        let nextState;
+        if (this.useSymbolized) {
+          nextState = simulate(oppMove, this.root.gameState, this.rulesLibrary);
+        } else {
+          nextState = definemorefacts([], simulate(oppMove, this.root.gameState, this.rulesLibrary));
+        }
+        this.root = this._node(nextState, null);
+      }
+      this._initRootPriors();
+
+      // Ensure all root children have at least one rollout
+      this._ensureRootCoverage();
+    }
+  }
+
+  // Continuous search method for background processing
+  continueSearch() {
+    if (!this.root) return;
+
+    // Run a few MCTS iterations without selecting a final move
+    const miniDeadline = Date.now() + 100; // Small time chunk
+    while (Date.now() < miniDeadline) {
+      this._iterate(this.root);
+    }
+  }
+
+  selectMove() {
+    // FEATURE: Check for immediate wins before starting search
+    if (USE_IMMEDIATE_WIN_DETECTION) {
+      const winningMove = findWinningMove(this.root.gameState);
+      if (winningMove) {
+        return winningMove;
+      }
+    }
+
+    // Choose rollout parameter arm
+    this.activeArmIdx = selectParamArm();
+    const arm = PARAM_ARMS[this.activeArmIdx];
+    this.rollDepth = arm.depth;
+    this.rollPDeep = arm.pDeep;
+
+    // Run search until deadline
+    this.deadline = Date.now() + playClockSeconds * 1000 - SAFETY_BUFFER_MILLISECONDS;
+
+    // Prune losing moves before search if applicable
+    this._pruneLosingMoves();
+
+    // Continue searching until deadline
+    while (Date.now() < this.deadline) {
+      this._iterate(this.root);
+    }
+
+    // Return best action and record regret for UCB1
+    const bestMove = this._selectBestAction();
+    return bestMove;
+  }
+
+  play(oppMove) {
+    this.processOpponentMove(oppMove);
+    return this.selectMove();
+  }
+
+  stop() { return false; }
+  abort() { return false; }
+
+  // Ensure all root children have at least one visit
+// Ensure all root children have at least one rollout, but stop if we hit the deadline
+_ensureRootCoverage() {
+  if (!this.root) return;
+
+  // FEATURE: Check for winning children first
+  if (USE_IMMEDIATE_WIN_DETECTION) {
+    for (const child of this.root.children) {
+      if (
+        findterminalp(child.gameState, this.rulesLibrary) &&
+        findreward(this.playerRole, child.gameState, this.rulesLibrary) === 100
+      ) {
+        // Clear other children to force selection of this one
+        this.root.children = [child];
+        return;
+      }
+    }
+  }
+
+  // Expand if needed
+  if (this.root.children.length === 0) {
+    this._initRootPriors();
+  }
+
+  // Ensure every child has at least one visit, but bail out on deadline
+  for (const child of this.root.children) {
+    if (Date.now() >= this.deadline) break;
+    if (child.visit === 0) {
+      const result = this._depthcharge(child.gameState);
+      child.visit = 1;
+      child.val = result;
+      this.root.visit += 1;
+      this.root.val += result;
+    }
+  }
+}
+
+  // Prune losing moves to avoid immediate defeats
+  _pruneLosingMoves() {
+    if (!USE_LOSING_MOVE_PRUNING || !this.root) return;
+
+    // Find losing moves
+    const losingMoves = findLosingMoves(this.root.gameState);
+    if (losingMoves === null) return;
+
+    // Filter actions and children arrays
+    const newChildren = [];
+
+    for (let i = 0; i < this.root.children.length; i++) {
+      const child = this.root.children[i];
+      const action = child.act;
+
+      // Check if action is in losing moves list
+      const isLosing = losingMoves.some(m => equalp(m, action));
+
+      if (!isLosing) {
+        newChildren.push(child);
+      }
+    }
+
+    // Update root children and unexplored actions
+    this.root.children = newChildren;
+    this.root.unexp = this.root.unexp.filter(action =>
+      !losingMoves.some(m => equalp(m, action))
+    );
+  }
+
+  // ---- root priors ------------------------------------------------------
+_initRootPriors() {
+  if (!this.root) return;
+  // if we’re already out of time, skip priors entirely
+  if (Date.now() >= this.deadline) return;
+
+  // 1) Gather candidate moves
+  let moves = [...this._cands(this.root)];
+  if (!moves.length) {
+    moves = safeLegals(this.root.gameState, this.rulesLibrary);
+  }
+
+  // 2) Compute heuristic weights once
+  const w = heuristicSelector.weights();
+
+  // 3) Score each move, but bail on deadline
+  const scores = [];
+  for (let i = 0; i < moves.length; i++) {
+    if (Date.now() >= this.deadline) break;
+
+    const m = moves[i];
+    let ns = this.useSymbolized
+      ? simulate(m, this.root.gameState, this.rulesLibrary)
+      : definemorefacts([], simulate(m, this.root.gameState, this.rulesLibrary));
+
+    // dot‑product of weights × heuristics
+    let sc = 0;
+    for (let h = 0; h < ALL_HEURISTICS.length; h++) {
+      sc += w[h] * ALL_HEURISTICS[h](ns);
+    }
+    scores.push(sc);
+  }
+
+  // 4) Normalize
+  const sum = scores.reduce((a, b) => a + b, 0) || 1;
+
+  // 5) Build children list, again respecting deadline
+  const newChildren = [];
+  for (let i = 0; i < scores.length; i++) {
+    if (Date.now() >= this.deadline) break;
+
+    const m = moves[i];
+    let ns = this.useSymbolized
+      ? simulate(m, this.root.gameState, this.rulesLibrary)
+      : definemorefacts([], simulate(m, this.root.gameState, this.rulesLibrary));
+
+    const node = this._node(ns, this.root);
+    node.act   = m;
+    node.prior = scores[i] / sum;
+    node.unexp = [];
+    newChildren.push(node);
+  }
+
+  // 6) Commit
+  this.root.children = newChildren;
+  this.root.unexp    = [];
+}
+
+
+  // ---- helpers ----------------------------------------------------------
+  _cands(n) {
+    const all = n.unexp.slice();
+    if (!this.useIterativeWidening) return all;
+    const cap = Math.max(1, Math.ceil(Math.pow(n.visit, this.iwExp)));
+    return shuffleArray(all).slice(0, cap);
+  }
+
+  _iterate(node) {
+    if (Date.now() >= this.deadline - 3) return;
+    const path = [node];
+
+    // selection
+    while (!node.unexp.length && node.children.length) {
+      const nxt = this._selectNode(node);
+      if (!nxt || nxt === node) break;
+      node = nxt;
+      path.push(node);
+      if (Date.now() >= this.deadline - 3) return;
+    }
+
+    // expansion
+    if (node.unexp.length) {
+      if (Date.now() >= this.deadline) return;
+      const canExpand = !this.useIterativeWidening || node.children.length
+          Math.ceil(Math.pow(node.visit, this.iwExp));
+      if (canExpand) {
+        const i = Math.floor(Math.random() * node.unexp.length);
+        const mv = node.unexp.splice(i, 1)[0];
+        let ns;
+        if (this.useSymbolized) {
+          ns = simulate(mv, node.gameState, this.rulesLibrary);
+        } else {
+          ns = definemorefacts([], simulate(mv, node.gameState, this.rulesLibrary));
+        }
+        const ch = this._node(ns, node);
+        ch.act = mv;
+        ch.prior = 1/(node.unexp.length+1);
+        node.children.push(ch);
+        node = ch;
+        path.push(node);
+      }
+    }
+
+    // simulation
+    const r = this._rollout(node.gameState);
+
+    // backpropagation
+    for (const n of path) {
+      n.visit++;
+      n.val += r;
+    }
+  }
+
+  // Support both UCT and PUCT selection strategies
+  _selectNode(n) {
+    if (!n.children.length) return n;
+
+    if (this.useUCT) {
+      return this._selectUCT(n);
+    } else {
+      return this._selectPUCT(n);
+    }
+  }
+
+  // Original PUCT selection
+  _selectPUCT(n) {
+    if (!n.children.length) return n;
+    const logN = Math.log(n.visit + 1);
+    let best = {node: n, score: -Infinity};
+    for (const c of n.children) {
+      if (c.prior === undefined || Number.isNaN(c.prior)) c.prior = 1/n.children.length;
+      const q = c.val/(c.visit || 1);
+      const u = PUCT_EXPLORATION_CONSTANT * c.prior * Math.sqrt(logN/(1+c.visit));
+      const s = q + u;
+      if (s > best.score) best = {node: c, score: s};
+    }
+    return best.node;
+  }
+
+  // UCT selection (from caniac_combo)
+  _selectUCT(n) {
+    if (!n.children.length) return n;
+    const totalVisits = n.visit;
+    let best = {node: null, score: -Infinity};
+
+    for (const child of n.children) {
+      const exploitation = child.visit === 0 ? 0 : child.val / child.visit;
+      const exploration = UCT_EXPLORATION_CONSTANT * Math.sqrt(Math.log(totalVisits + 1) / (child.visit + 1));
+      const score = exploitation + exploration;
+
+      if (score > best.score) {
+        best = {node: child, score: score};
+      }
+    }
+
+    return best.node;
+  }
+
+  // ---- rollout ----------------------------------------------------------
+// Updated _rollout to also try MAB-A heuristic arms**
+  _rollout(s, d = 0) {
+  // 1) Time cutoff
+  if (Date.now() >= this.deadline - 3) {
+    const reward = findreward(this.playerRole, s, this.rulesLibrary);
+    return USE_REWARD_RESCALING ? rescaleReward(reward) : reward;
+  }
+
+  // ===== IN‑TURN MAB‑B: pick rollout‑parameter arm at top level =====
+  let armIdx, oldDepth, oldPDeep;
+  if (d === 0) {
+    armIdx = selectParamArm();  // logs [MAB‑B] trial=… pick=…
+    const arm = PARAM_ARMS[armIdx];
+    oldDepth  = this.rollDepth;
+    oldPDeep  = this.rollPDeep;
+    this.rollDepth = arm.depth;
+    this.rollPDeep = arm.pDeep;
+  }
+
+  // ===== IN‑TURN MAB‑A: pick heuristic at top level =====
+  let heurIdx;
+  if (d === 0) {
+    heurIdx = heuristicSelector.select();   // logs [MAB‑A] turn=… pick=…
+  }
+
+  // 2) Possibly deep playout
+  if (d === 0 && Math.random() < this.rollPDeep) {
+    const result = this._depthcharge(s);
+    // record both bandits
+    if (d === 0) {
+      recordParamArm(armIdx, result);               // logs [MAB‑B] record…
+      heuristicSelector.record(heurIdx, result);    // logs [MAB‑A] record…
+      // restore defaults
+      this.rollDepth = oldDepth;
+      this.rollPDeep = oldPDeep;
+    }
+    return result;
+  }
+
+  // 3) Shallow‐eval cutoff
+  if (d >= this.rollDepth) {
+    const w = heuristicSelector.weights();          // logs [MAB‑A] weights…
+    const result = ALL_HEURISTICS.reduce((v,f,i) => v + w[i]*f(s), 0);
+    if (d === 0) {
+      recordParamArm(armIdx, result);
+      heuristicSelector.record(heurIdx, result);
+      this.rollDepth = oldDepth;
+      this.rollPDeep = oldPDeep;
+    }
+    return result;
+  }
+
+  // 4) Normal recursion
+  const acts = safeLegals(s, this.rulesLibrary);
+  if (!acts.length) {
+    const result = findreward(this.playerRole, s, this.rulesLibrary);
+    if (d === 0) {
+      recordParamArm(armIdx, result);
+      heuristicSelector.record(heurIdx, result);
+      this.rollDepth = oldDepth;
+      this.rollPDeep = oldPDeep;
+    }
+    return USE_REWARD_RESCALING ? rescaleReward(result) : result;
+  }
+
+  // 5) Recursive descent
+  const mv = acts[Math.floor(Math.random() * acts.length)];
+  const ns = this.useSymbolized
+             ? simulate(mv, s, this.rulesLibrary)
+             : definemorefacts([], simulate(mv, s, this.rulesLibrary));
+  const result = this._rollout(ns, d + 1);
+
+  // 6) Final record & restore
+  if (d === 0) {
+    recordParamArm(armIdx, result);
+    heuristicSelector.record(heurIdx, result);
+    this.rollDepth = oldDepth;
+    this.rollPDeep = oldPDeep;
+  }
+  return result;
+}
+
+
+
+
+  _depthcharge(s) {
+    let st = s;
+    while (!findterminalp(st, this.rulesLibrary)) {
+      if (Date.now() >= this.deadline - 3) break;
+      const acts = safeLegals(st, this.rulesLibrary);
+      if (!acts.length) break;
+      const a = acts[Math.floor(Math.random() * acts.length)];
+      if (this.useSymbolized) {
+        // For symbolized states, we can use differential update (faster)
+        st = simulate(a, st, this.rulesLibrary);
+      } else {
+        st = definemorefacts([], simulate(a, st, this.rulesLibrary));
+      }
+    }
+
+    let reward = findreward(this.playerRole, st, this.rulesLibrary);
+    return USE_REWARD_RESCALING ? rescaleReward(reward) : reward;
+  }
+
+  // Enhanced move selection with visit count
+  _selectBestAction() {
+    if (!this.root || this.root.children.length === 0) {
+      const legalMoves = safeLegals(this.root ? this.root.gameState : [], this.rulesLibrary);
+      return legalMoves.length > 0 ? legalMoves[0] : 'noop';
+    }
+
+    // Find best child by visit count (more robust than value)
+    let best = null;
+    for (const c of this.root.children) {
+      if (!best || c.visit > best.visit) best = c;
+    }
+
+    // Calculate regret for parameter tuning
+    const bestMove = best ? best.act : (safeLegals(this.root.gameState, this.rulesLibrary)[0] || 'noop');
+
+    // Record regret for bandit algorithm
+    const qVals = this.root.children.map(c => c.val / c.visit);
+    const maxQ = qVals.length ? Math.max(...qVals) : 0;
+    const chosenQ = best ? best.val / best.visit : 0;
+    const regret = maxQ - chosenQ;
+
+    recordParamArm(this.activeArmIdx, -regret); // reward = -regret
+
+    return bestMove;
+  }
+}
+
+//==============================================================================
+// End of player code
+//==============================================================================
+</script>
+</head>
+
+<!--=======================================================================-->
+
+<body bgcolor='#aabbbb' onload='doinitialize()'>
+  <center>
+    <table width='720' cellspacing='0' cellpadding='40' bgcolor='#ffffff'>
+      <tr>
+        <td>
+
+<!--=======================================================================-->
+
+<center>
+  <table width='640' cellpadding='0'>
+    <tr>
+      <td width='180' align='center' valign='center'>
+        <img width='130' src='http://gamemaster.stanford.edu/images/ggp.jpg'/>
+      </td>
+      <td align='center'>
+        <span style='font-size:18pt'>&nbsp;</span>
+        <span style='font-size:32pt'>Gamemaster</span><br/>
+      </td>
+      <td width='180' align='center' style='color:#000066;font-size:18px'>
+        <i>General<br/>Game<br/>Playing</i>
+      </td>
+    </tr>
+  </table>
+</center>
+
+<!--=======================================================================-->
+
+<br/>
+<table width='640' cellpadding='8' cellspacing='0' bgcolor='#f4f8f8' border='1'>
+  <tr height='40'>
+     <td align='center'>
+<table style='color:#000066;font-size:18px'>
+  <tr>
+    <td>
+Protocol: localstorage<br/>
+Metagamer: none<br/>
+Strategy: custom<br/>
+Identifier: <span id='player'>Lemur</span> <img src="http://gamemaster.stanford.edu/images/pencil.gif" onclick='doplayer()'/>
+    </td>
+  </tr>
+</table>
+    </td>
+  </tr>
+</table>
+<br/>
+
+<!--=======================================================================-->
+
+<center>
+  <br/>
+  <textarea id='transcript' style='font-family:courier' rows='30' cols='80' readonly></textarea>
+</center>
+
+<!--=======================================================================-->
+
+        </td>
+      </tr>
+    </table>
+  </center>
+</body>
+
+<!--=======================================================================-->
+
+</html>
