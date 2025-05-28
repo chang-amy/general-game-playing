@@ -397,11 +397,6 @@ class AlphaBetaSearchEngine {
   }
 
   processOpponentMove(opponentMove) {
-    if (this.opponentRoles.length === 0) {
-      console.log("[Lemur] Skipping opponent move: single-player game.");
-      return;
-    }
-
     if (opponentMove !== 'nil') {
       if (this.useSymbolized) {
         this.rootState = simulate(opponentMove, this.rootState, this.rulesLibrary);
@@ -872,11 +867,6 @@ class MonteCarloTreeSearchEngine {
   }
 
   processOpponentMove(oppMove) {
-    if (this.opponentRoles.length === 0) {
-      console.log("[Lemur] Skipping opponent move: single-player game.");
-      return;
-    }
-
     if (oppMove !== 'nil' && this.root) {
       const c = this.root.children.find(k => equalp(k.act, oppMove));
       if (c) {
