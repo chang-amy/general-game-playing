@@ -212,16 +212,12 @@ function play(opponentMove) {
     move = unsymbolizeatom(move);
   }
 
-  const legalMoves = safeLegals(selectedEngine.getCurrentState(), gameRulesLibrary);
-  const fallbackMove = legalMoves[0] || 'noop';
+  console.log("[Lemur] Selected move:", move);
 
-  const isValid = legalMoves.some(m => equalp(m, move));
-  if (!isValid) {
-    console.warn("[Lemur] WARNING: Invalid move selected! Falling back to:", fallbackMove);
-    return fallbackMove;
+  if (selectedEngine && typeof selectedEngine.processOpponentMove === 'function') {
+    selectedEngine.processMove(move);
   }
 
-  console.log("[Lemur] Selected valid move:", move);
   return move;
 }
 
@@ -401,6 +397,11 @@ class AlphaBetaSearchEngine {
   }
 
   processOpponentMove(opponentMove) {
+    if (this.opponentRoles.length === 0) {
+      console.log("[Lemur] Skipping opponent move: single-player game.");
+      return;
+    }
+
     if (opponentMove !== 'nil') {
       if (this.useSymbolized) {
         this.rootState = simulate(opponentMove, this.rootState, this.rulesLibrary);
@@ -438,7 +439,6 @@ class AlphaBetaSearchEngine {
     this.performIterativeDeepening(deadline);
     return this.chosenMove;
   }
-
 
   stop() {
     return false;
@@ -872,6 +872,11 @@ class MonteCarloTreeSearchEngine {
   }
 
   processOpponentMove(oppMove) {
+    if (this.opponentRoles.length === 0) {
+      console.log("[Lemur] Skipping opponent move: single-player game.");
+      return;
+    }
+
     if (oppMove !== 'nil' && this.root) {
       const c = this.root.children.find(k => equalp(k.act, oppMove));
       if (c) {
