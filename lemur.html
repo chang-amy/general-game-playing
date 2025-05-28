@@ -290,9 +290,9 @@ function evaluateLexZeroSum(gameState) {
   const isTerminal = findterminalp(gameState, gameRulesLibrary);
 
   // lost if any opponent has a higher score and terminal state
-  const lostTerminal = isTerminal && this.opponentRoles.some(role =>
-    findreward(role, gameState, gameRulesLibrary) > findreward(playerRole, gameState, gameRulesLibrary)
-  );
+  const lostTerminal = isTerminal && selectedEngine.getOpponentRoles().some(role =>
+  findreward(role, gameState, gameRulesLibrary) > findreward(playerRole, gameState, gameRulesLibrary)
+);
 
   const reachedMax = opponentScores.some(s => s === 100);
   const safeFlag = (lostTerminal || reachedMax) ? 0 : 1;
@@ -439,10 +439,6 @@ class AlphaBetaSearchEngine {
     return this.chosenMove;
   }
 
-  play(opponentMove) {
-    this.processOpponentMove(opponentMove);
-    return this.selectMove();
-  }
 
   stop() {
     return false;
