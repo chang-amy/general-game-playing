@@ -70,78 +70,80 @@ var player = 'lemur';
 // -------------------------------------------------------------
 
 function ping() {
+  console.log("[Lemur] ping received");
   return 'ready';
 }
 
 function start(role, ruleSet, startClock, playClock) {
+  console.log(`[Lemur] Starting game as role: ${role}`);
   playerRole = role;
   startClockSeconds = parseInt(startClock, 10);
   playClockSeconds = parseInt(playClock, 10);
 
-  // Process rules through comprehensive preprocessing pipeline
   if (USE_PREPROCESSING_PIPELINE) {
+    console.log("[Lemur] Running preprocessing pipeline");
     let rules = ruleSet.slice(1);
 
-    // Step 1: Optimize rule structure by ordering and pruning subgoals
     if (typeof prunerulesubgoals === 'function') {
       rules = prunerulesubgoals(rules);
+      console.log("[Lemur] Applied prunerulesubgoals");
     }
     if (typeof prunerules === 'function') {
       rules = prunerules(rules);
+      console.log("[Lemur] Applied prunerules");
     }
     if (typeof fixrules === 'function') {
       rules = fixrules(rules);
+      console.log("[Lemur] Applied fixrules");
     }
 
-    // Prepare for next steps
     rules = definemorerules([], rules);
 
-    // Step 2: Ground the rules with a deadline
     let groundedRules = null;
     if (typeof groundrules === 'function') {
       try {
         groundedRules = groundrules(rules, (startClockSeconds - 5) * 1000);
+        console.log("[Lemur] Grounding successful");
       } catch (e) {
-        console.log("Grounding failed: " + e);
+        console.warn("[Lemur] Grounding failed:", e);
       }
     }
 
-    // Step 3-5: If grounding succeeded, symbolize, simplify, and prune
     if (groundedRules) {
       if (typeof symbolizerules === 'function') {
         rules = symbolizerules(groundedRules);
         interpreter = USE_HYBRID_INTERPRETER ? 'symbol' : 'general';
+        console.log(`[Lemur] Symbolized rules (interpreter: ${interpreter})`);
       }
 
       if (typeof simplifyrules === 'function') {
         rules = simplifyrules(rules);
+        console.log("[Lemur] Simplified rules");
       }
 
-      // Redefine rules
       rules = definemorerules([], rules);
       rules = pruneprogram(role, rules);
-
-
       gameRulesLibrary = definemorerules([], rules);
+      console.log("[Lemur] Final rules prepared");
     } else {
-      // Fall back to original rules if preprocessing failed
       gameRulesLibrary = definemorerules([], ruleSet.slice(1));
+      console.log("[Lemur] Using fallback ungrounded rules");
     }
   } else {
-    // Use original rules without preprocessing
     gameRulesLibrary = definemorerules([], ruleSet.slice(1));
+    console.log("[Lemur] Preprocessing disabled, using raw rules");
   }
 
-  // Initialize state
   const initialFacts = findinits(gameRulesLibrary);
   const initialState = interpreter === 'symbol' ? initialFacts : definemorefacts([], initialFacts);
-
-  // Select engine based on game complexity
   const legalMoves = findlegals(initialState, gameRulesLibrary);
   const branchingFactor = legalMoves.length;
 
+  console.log(`[Lemur] Initial branching factor: ${branchingFactor}`);
+
   if (branchingFactor > BRANCH_FACTOR_SWITCH_THRESHOLD) {
     const useIterativeWidening = branchingFactor > BRANCH_FACTOR_WIDENING_THRESHOLD;
+    console.log("[Lemur] Using MCTS engine");
     selectedEngine = new MonteCarloTreeSearchEngine(
       playerRole,
       gameRulesLibrary,
@@ -151,6 +153,7 @@ function start(role, ruleSet, startClock, playClock) {
       }
     );
   } else {
+    console.log("[Lemur] Using AlphaBeta engine");
     selectedEngine = new AlphaBetaSearchEngine(
       playerRole,
       gameRulesLibrary,
@@ -160,34 +163,32 @@ function start(role, ruleSet, startClock, playClock) {
 
   selectedEngine.initializeRoot(initialState);
 
-  // Use remaining start clock for background processing
   const deadline = Date.now() + (startClockSeconds * 1000) - SAFETY_BUFFER_MILLISECONDS;
   while (Date.now() < deadline) {
     selectedEngine.continueSearch();
   }
 
+  console.log("[Lemur] Initialization complete");
   return 'ready';
 }
 
 function play(opponentMove) {
-  // Handle symbolization if needed
+  console.log(`[Lemur] Opponent move: ${opponentMove}`);
+
   if (interpreter === 'symbol' && opponentMove !== 'nil' && typeof symbolizeatom === 'function') {
     opponentMove = symbolizeatom(opponentMove);
   }
 
   if (opponentMove !== 'nil') {
-    // Process the opponent's move
     selectedEngine.processOpponentMove(opponentMove);
   }
 
-  // FEATURE: Quick win detection before regular search
   if (USE_IMMEDIATE_WIN_DETECTION) {
     const currentState = selectedEngine.getCurrentState();
     if (findcontrol(currentState, gameRulesLibrary) === playerRole) {
       const winningMove = findWinningMove(currentState);
       if (winningMove) {
-        console.log("Found immediate winning move!");
-        // Convert from symbolized move if needed
+        console.log("[Lemur] Found immediate winning move!");
         if (interpreter === 'symbol' && typeof unsymbolizeatom === 'function') {
           return unsymbolizeatom(winningMove);
         }
@@ -196,33 +197,41 @@ function play(opponentMove) {
     }
   }
 
-  // Utilize opponent's thinking time if it's not our turn
   if (USE_BACKGROUND_PROCESSING) {
     const currentState = selectedEngine.getCurrentState();
     const deadline = Date.now() + (playClockSeconds - 2) * 1000;
 
     while (findcontrol(currentState, gameRulesLibrary) !== playerRole && Date.now() < deadline) {
       selectedEngine.continueSearch();
-      if (opponentMove === 'nil') break; // Exit if we have no opponent move context
+      if (opponentMove === 'nil') break;
     }
   }
 
-  // Get the best move
   let move = selectedEngine.selectMove();
-
-  // Convert back from symbolized move if needed
   if (interpreter === 'symbol' && move !== 'nil' && typeof unsymbolizeatom === 'function') {
     move = unsymbolizeatom(move);
   }
 
+  const legalMoves = safeLegals(selectedEngine.getCurrentState(), gameRulesLibrary);
+  const fallbackMove = legalMoves[0] || 'noop';
+
+  const isValid = legalMoves.some(m => equalp(m, move));
+  if (!isValid) {
+    console.warn("[Lemur] WARNING: Invalid move selected! Falling back to:", fallbackMove);
+    return fallbackMove;
+  }
+
+  console.log("[Lemur] Selected valid move:", move);
   return move;
 }
 
 function stop() {
+  console.log("[Lemur] stop called");
   return selectedEngine.stop();
 }
 
 function abort() {
+  console.log("[Lemur] abort called");
   return selectedEngine.abort();
 }
 
@@ -329,7 +338,7 @@ function findLosingMoves(state) {
       if (!findterminalp(oppState, gameRulesLibrary)) return false;
 
       const myScore = findreward(playerRole, oppState, gameRulesLibrary);
-      const maxOpponentScore = Math.max(...opponentRoles.map(r => findreward(r, oppState, gameRulesLibrary)));
+      const maxOpponentScore = Math.max(selectedEngine.getOpponentRoles().map(r => findreward(r, oppState, gameRulesLibrary)));
 
       return maxOpponentScore > myScore;
     });
@@ -512,7 +521,8 @@ class AlphaBetaSearchEngine {
         const nextFacts = simulate(move, state, this.rulesLibrary);
         ns = definemorefacts([], nextFacts);
       }
-      return findreward(this.opponentRoles, ns, this.rulesLibrary) !== 100;
+      return Math.max(...this.opponentRoles.map(r => findreward(r, ns, this.rulesLibrary))) !== 100;
+
     });
 
     const candidateMoves = safeMoves.length > 0 ? safeMoves : allMoves;
@@ -556,7 +566,7 @@ class AlphaBetaSearchEngine {
 
     const myScore = findreward(playerRole, state, gameRulesLibrary);
 
-    const opponentScore = Math.max(...this.opponentRoles.map(r => findreward(r, gameState, this.rulesLibrary)));
+    const opponentScore = Math.max(...this.opponentRoles.map(r => findreward(r, state, this.rulesLibrary)));
 
     const isTerminal = findterminalp(state, this.rulesLibrary);
 
@@ -576,7 +586,7 @@ class AlphaBetaSearchEngine {
         const nextFacts = simulate(move, state, this.rulesLibrary);
         ns = definemorefacts([], nextFacts);
       }
-      return findreward(this.getOpponentRoles(), ns, this.rulesLibrary) !== 100;
+      return Math.max(...this.opponentRoles.map(r => findreward(r, ns, this.rulesLibrary))) !== 100;
     });
 
     if (legalActions.length === 0) {
@@ -721,7 +731,7 @@ function immediateWinThreatHeuristic(s) {
     } else {
       ns = definemorefacts([], simulate(m, s, globalRulesLibrary));
     }
-    return findterminalp(ns, globalRulesLibrary) && findreward(globalPlayerRoles, ns, globalRulesLibrary) === 100;
+    return findterminalp(ns, globalRulesLibrary) && findreward(globalPlayerRole, ns, globalRulesLibrary) === 100;
   }).length;
 }
 
@@ -815,7 +825,9 @@ function recordParamArm(i, val) {
 
 }
 
-// ===== MCTS Engine =======================================================
+// -------------------------------------------------------------
+// Engine 2: Monte Carlo Tree Search (MCTS)
+// -------------------------------------------------------------
 class MonteCarloTreeSearchEngine {
   constructor(role, rules, opt = {}) {
     this.playerRole = role;
